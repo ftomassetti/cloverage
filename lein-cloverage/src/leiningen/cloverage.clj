@@ -1,5 +1,6 @@
 (ns leiningen.cloverage
   (:require [leiningen.run :as run]
+            [leiningen.core.eval :as eval]
             [bultitude.core :as blt]
             [clojure.java.io :as io]
             [bultitude.core :as b]
@@ -10,6 +11,8 @@
 
 (defn get-lib-version []
   (or (System/getenv "CLOVERAGE_VERSION") "RELEASE"))
+
+(def ^:dynamic *exit-after-tests* true)
 
 (def form-for-suppressing-unselected-tests
   "A function that figures out which vars need to be suppressed based on the
@@ -97,6 +100,66 @@
       (main/abort "Please specify :test-selectors in project.clj"))
     [nses selectors]))
 
+(defn- form-for-select-namespaces [namespaces selectors]
+  `(reduce (fn [acc# [f# args#]]
+             (if (vector? f#)
+               (filter #(apply (first f#) % args#) acc#)
+               acc#))
+     '~namespaces ~selectors))
+
+(defn- form-for-nses-selectors-match [selectors ns-sym]
+  `(distinct
+     (for [ns# ~ns-sym
+           [_# var#] (ns-publics ns#)
+           :when (some (fn [[selector# args#]]
+                         (apply (if (vector? selector#)
+                                  (second selector#)
+                                  selector#)
+                           (merge (-> var# meta :ns meta)
+                             (assoc (meta var#) ::var var#))
+                           args#))
+                   ~selectors)]
+       ns#)))
+;; TODO: make this an arg to form-for-testing-namespaces in 3.0.
+(def ^:private ^:dynamic *monkeypatch?* true)
+
+(defn form-for-testing-namespaces
+  "Return a form that when eval'd in the context of the project will test each
+  namespace and print an overall summary."
+  ([namespaces _ & [selectors]]
+    (let [ns-sym (gensym "namespaces")]
+      `(let [~ns-sym ~(form-for-select-namespaces namespaces selectors)]
+         (when (seq ~ns-sym)
+           (apply require :reload ~ns-sym))
+         (let [failures# (atom #{})
+               selected-namespaces# ~(form-for-nses-selectors-match selectors ns-sym)
+               _# nil ;(when ~*monkeypatch?*
+                  ;  (leiningen.core.injected/add-hook
+                   ;   #'clojure.test/report
+                    ;  (fn [report# m# & args#]
+                     ;   (when (#{:error :fail} (:type m#))
+                      ;    (when-let [first-var# (-> clojure.test/*testing-vars* first meta)]
+                       ;     (swap! failures# conj (ns-name (:ns first-var#)))
+                        ;    (newline)
+                         ;   (println "lein test :only"
+                          ;    (str (ns-name (:ns first-var#)) "/"
+                           ;     (:name first-var#)))))
+               ;         (if (= :begin-test-ns (:type m#))
+                ;          (clojure.test/with-test-out
+                 ;           (newline)
+                  ;          (println "lein test" (ns-name (:ns m#))))
+                   ;       (apply report# m# args#)))))
+               summary# (binding [clojure.test/*test-out* *out*]
+                          (~form-for-suppressing-unselected-tests
+                            selected-namespaces# ~selectors
+                            #(apply ~'clojure.test/run-tests selected-namespaces#)))]
+           (spit ".lein-failures" (if ~*monkeypatch?*
+                                    (pr-str @failures#)
+                                    "#<disabled :monkeypatch-clojure-test>"))
+           (if ~*exit-after-tests*
+             (System/exit (+ (:error summary#) (:fail summary#)))
+             (+ (:error summary#) (:fail summary#))))))))
+
 (defn cloverage
   "Run code coverage on the project.
 
@@ -104,10 +167,15 @@
   Specify -o OUTPUTDIR for output directory, for other options see cloverage."
   [project & args]
   (let [[nses selectors] (read-args args project)
-         source-namespaces (ns-names-for-dirs (:source-paths project))
-        test-namespace    (ns-names-for-dirs (:test-paths project))]
+        source-namespaces (ns-names-for-dirs (:source-paths project))
+        test-namespace (ns-names-for-dirs (:test-paths project))]
     (println "nses" nses)
     (println "selectors" selectors)
+    (let [form (form-for-testing-namespaces nses nil (vec selectors))]
+      (eval/eval-in-project project form
+        '(require 'clojure.test)))
+    ;(~form-for-suppressing-unselected-tests
+    ;  nses selectors (fn [] (println "Running...")))
     (System/exit 0)
     (apply run/run (update-in project [:dependencies]
                               conj    ['cloverage (get-lib-version)])
